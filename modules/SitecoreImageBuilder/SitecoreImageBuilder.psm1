@@ -12,7 +12,10 @@ function Invoke-PackageRestore
         [string]$Destination
         ,
         [Parameter(Mandatory = $false)]
-        [array]$Tags = @("*")
+        [array]$Tags = (Get-LatestSupportedVersionTags)
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$AutoGenerateWindowsVersionTags = (Get-SupportedWindowsVersions)
         ,
         [Parameter(Mandatory = $false)]
         [ValidateSet("Include", "Skip")]
@@ -31,7 +34,7 @@ function Invoke-PackageRestore
     $ErrorActionPreference = "STOP"
     $ProgressPreference = "SilentlyContinue"
 
-    $downloadUrl = "https://dev.sitecore.net"
+    $sitecoreDownloadUrl = "https://dev.sitecore.net"
 
     # Load packages file
     $packagesFile = Get-Item -Path (Join-Path $PSScriptRoot "..\..\sitecore-packages.json")
@@ -46,8 +49,8 @@ function Invoke-PackageRestore
     }
 
     # Find out which files is needed
-    $downloadSession = $null
-    $specs = Initialize-BuildSpecifications -Specifications (Get-BuildSpecifications -Path $Path) -InstallSourcePath $destinationPath -Tags $Tags -ImplicitTagsBehavior "Include" -DeprecatedTagsBehavior $DeprecatedTagsBehavior
+    $sitecoreDownloadSession = $null
+    $specs = Initialize-BuildSpecifications -Specifications (Get-BuildSpecifications -Path $Path -AutoGenerateWindowsVersionTags $AutoGenerateWindowsVersionTags) -InstallSourcePath $Destination -Tags $Tags -ImplicitTagsBehavior "Include" -DeprecatedTagsBehavior $DeprecatedTagsBehavior
     $expected = $specs | Where-Object { $_.Include -and $_.Sources.Length -gt 0 } | Select-Object -ExpandProperty Sources -Unique
 
     # Check or download needed files
@@ -85,29 +88,37 @@ function Invoke-PackageRestore
 
         if ($PSCmdlet.ShouldProcess($fileName))
         {
-            # Login to dev.sitecore.net and save session for re-use
-            if ($null -eq $downloadSession)
-            {
-                Write-Verbose ("Logging in to '{0}'..." -f $downloadUrl)
-
-                $loginResponse = Invoke-WebRequest "https://dev.sitecore.net/api/authorization" -Method Post -Body @{
-                    username   = $SitecoreUsername
-                    password   = $SitecorePassword
-                    rememberMe = $true
-                } -SessionVariable "downloadSession" -UseBasicParsing
-
-                if ($null -eq $loginResponse -or $loginResponse.StatusCode -ne 200 -or $loginResponse.Content -eq "false")
-                {
-                    throw ("Unable to login to '{0}' with the supplied credentials." -f $downloadUrl)
-                }
-
-                Write-Verbose ("Logged in to '{0}'." -f $downloadUrl)
-            }
-
-            # Download package using saved session
             Write-Host ("Downloading '{0}' to '{1}'..." -f $fileUrl, $filePath)
 
-            Invoke-WebRequest -Uri $fileUrl -OutFile $filePath -WebSession $downloadSession -UseBasicParsing
+            if ($fileUrl.StartsWith($sitecoreDownloadUrl))
+            {
+                # Login to dev.sitecore.net and save session for re-use
+                if ($null -eq $sitecoreDownloadSession)
+                {
+                    Write-Verbose ("Logging in to '{0}'..." -f $sitecoreDownloadUrl)
+
+                    $loginResponse = Invoke-WebRequest "https://dev.sitecore.net/api/authorization" -Method Post -Body @{
+                        username   = $SitecoreUsername
+                        password   = $SitecorePassword
+                        rememberMe = $true
+                    } -SessionVariable "downloadSession" -UseBasicParsing
+
+                    if ($null -eq $loginResponse -or $loginResponse.StatusCode -ne 200 -or $loginResponse.Content -eq "false")
+                    {
+                        throw ("Unable to login to '{0}' with the supplied credentials." -f $sitecoreDownloadUrl)
+                    }
+
+                    Write-Verbose ("Logged in to '{0}'." -f $sitecoreDownloadUrl)
+                }
+
+                # Download package using saved session
+                Invoke-WebRequest -Uri $fileUrl -OutFile $filePath -WebSession $sitecoreDownloadSession -UseBasicParsing
+            }
+            else
+            {
+                # Download package
+                Invoke-WebRequest -Uri $fileUrl -OutFile $filePath -UseBasicParsing
+            }
         }
     }
 
@@ -117,6 +128,7 @@ function Invoke-PackageRestore
 function Invoke-Build
 {
     [CmdletBinding(SupportsShouldProcess = $true)]
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidUsingPlainTextForPassword", "SitecorePassword")]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateScript( { Test-Path $_ -PathType "Container" })]
@@ -129,7 +141,10 @@ function Invoke-Build
         [string]$Registry
         ,
         [Parameter(Mandatory = $false)]
-        [array]$Tags = @("*")
+        [array]$Tags = (Get-LatestSupportedVersionTags)
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$AutoGenerateWindowsVersionTags = (Get-SupportedWindowsVersions)
         ,
         [Parameter(Mandatory = $false)]
         [ValidateSet("Include", "Skip")]
@@ -153,10 +168,10 @@ function Invoke-Build
     $ProgressPreference = "SilentlyContinue"
 
     # Find out what to build
-    $specs = Initialize-BuildSpecifications -Specifications (Get-BuildSpecifications -Path $Path) -InstallSourcePath $InstallSourcePath -Tags $Tags -ImplicitTagsBehavior $ImplicitTagsBehavior -DeprecatedTagsBehavior $DeprecatedTagsBehavior
+    $specs = Initialize-BuildSpecifications -Specifications (Get-BuildSpecifications -Path $Path -AutoGenerateWindowsVersionTags $AutoGenerateWindowsVersionTags) -InstallSourcePath $InstallSourcePath -Tags $Tags -ImplicitTagsBehavior $ImplicitTagsBehavior -DeprecatedTagsBehavior $DeprecatedTagsBehavior
 
     # Print results
-    $specs | Select-Object -Property Tag, Include, Deprecated, Priority, Base | Format-Table
+    $specs | Sort-Object -Property Include, Priority, Tag | Select-Object -Property Tag, Include, Deprecated, Priority, Base | Format-Table
 
     # Determine OS
     $osType = (docker system info --format '{{json .}}' | ConvertFrom-Json | ForEach-Object { $_.OSType })
@@ -235,7 +250,12 @@ function Invoke-Build
                 $buildOptions.Add("--isolation 'hyperv'")
             }
 
-            $buildOptions.AddRange($spec.BuildOptions)
+            $spec.BuildOptions | ForEach-Object {
+                $option = $_
+
+                $buildOptions.Add($option)
+            }
+
             $buildOptions.Add("--tag '$tag'")
 
             $buildCommand = "docker image build {0} '{1}'" -f ($buildOptions -join " "), $spec.Path
@@ -246,16 +266,24 @@ function Invoke-Build
 
             $LASTEXITCODE -ne 0 | Where-Object { $_ } | ForEach-Object { throw "Failed: $buildCommand" }
 
+            # Check to see if we need to stop here...
+            if ([string]::IsNullOrEmpty($Registry))
+            {
+                Write-Host ("### Done with '{0}', but not pushed since 'Registry' was empty." -f $tag) -ForegroundColor Green
+
+                return
+            }
+
             # Tag image
             if ([string]::IsNullOrEmpty($Registry))
             {
                 $fulltag = $tag
-                $PushMode = "Never"
             }
             else
             {
                 $fulltag = "{0}/{1}" -f $Registry, $tag
             }
+
             docker image tag $tag $fulltag
 
             $LASTEXITCODE -ne 0 | Where-Object { $_ } | ForEach-Object { throw "Failed." }
@@ -263,7 +291,7 @@ function Invoke-Build
             # Check to see if we need to stop here...
             if ($PushMode -eq "Never")
             {
-                Write-Warning ("### Done with '{0}', but not pushed since 'PushMode' is '{1}'." -f $tag, $PushMode)
+                Write-Host ("### Done with '{0}', but not pushed since 'PushMode' is '{1}'." -f $tag, $PushMode) -ForegroundColor Green
 
                 return
             }
@@ -300,7 +328,7 @@ function Initialize-BuildSpecifications
         [string]$InstallSourcePath
         ,
         [Parameter(Mandatory = $false)]
-        [array]$Tags = @("*")
+        [array]$Tags = (Get-LatestSupportedVersionTags)
         ,
         [Parameter(Mandatory = $false)]
         [ValidateSet("Include", "Skip")]
@@ -368,41 +396,54 @@ function Initialize-BuildSpecifications
     $defaultPriority = 1000
     $priorities = New-Object System.Collections.Specialized.OrderedDictionary
     $priority = 0
+    $patterns = @(
+        "^sitecore-assets:(.*)$", # dependency
+        "^sitecore-certificates:(.*)$", # dependency
+        "^sitecore-openjdk:(.*)$", # dependency
+        "^mssql-developer:(.*)$", # dependency
 
-    "^mssql-developer:(.*)$",
-    "^sitecore-openjdk:(.*)$",
-    "^sitecore-base:(.*)$",
-    "^sitecore-xm-sql:(.*)$",
-    "^sitecore-xm-pse-(.*):(.*)$",
-    "^sitecore-xm1-sqldev:(.*)$",
-    "^sitecore-xm1-pse-(.*)-sqldev:(.*)$",
-    "^sitecore-xm1-pse-(.*)-cm:(.*)$",
-    "^sitecore-xp-sql:(.*)$",
-    "^sitecore-xp-pse-(.*)-sql:(.*)$",
-    "^sitecore-xp-base:(.*)$",
-    "^sitecore-xp-xconnect:(.*)$",
-    "^sitecore-xp-pse-(.*)-sqldev:(.*)$",
-    "^sitecore-xp-pse-(.*)-standalone:(.*)$" | ForEach-Object {
+        "^sitecore-base:(.*)$", # legacy\images
+        "^sitecore-xp-base:(.*)$", # legacy\images
+        "^sitecore-xp-xconnect:(.*)$", # legacy\images
+        "^sitecore-xm1-(sql|sqldev):(.*)$", # legacy\images
+        "^sitecore-xm1-(standalone|cm|cd):(.*)$" # legacy\images
+
+        "^sitecore-(xm1|xp)-pse-(.*)-sqldev:(.*)$" # legacy\variants
+        "^sitecore-(xm1|xp)-pse-(.*)-(standalone|cm|cd):(.*)$" # legacy\variants
+        "^sitecore-(xm1|xp)-sxa-(.*)-sqldev:(.*)$" # legacy\variants
+        "^sitecore-(xm1|xp)-sxa-(.*)-(standalone|cm|cd):(.*)$" # legacy\variants
+
+        "^sitecore-(xm|xp)-(sql|sqldev):(.*)$", # windows/linux platform
+        "^sitecore-(xm|xp)-(standalone|cm|cd):(.*)$" # windows platform
+
+        "^sitecore-(xm|xp)-(spe|pse)-(sql|sqldev):(.*)$" # SPE windows/linux variants
+        "^sitecore-(xm|xp)-(spe|pse)-(standalone|cm|cd):(.*)$" # SPE windows variants
+
+        "^sitecore-(xm|xp)-sxa-(sql|sqldev):(.*)$" # SXA windows/linux variants
+        "^sitecore-(xm|xp)-sxa-(standalone|cm|cd):(.*)$" # SXA  windows variants
+    )
+
+    $patterns | ForEach-Object {
         $priorities.Add($_, $priority)
         $priority++
     }
 
-$priorities.Add("^(.*)$", $defaultPriority)
+    $priorities.Add("^(.*)$", $defaultPriority)
 
-# Update specs, set priority according to rules
-$Specifications | ForEach-Object {
-    $spec = $_
-    $rule = $priorities.Keys | Where-Object { $spec.Tag -match $_ } | Select-Object -First 1
+    # Update specs, set priority according to rules
+    $Specifications | ForEach-Object {
+        $spec = $_
+        $rule = $priorities.Keys | Where-Object { $spec.Tag -match $_ } | Select-Object -First 1
 
-    $spec.Priority = $priorities[$rule]
-}
+        $spec.Priority = $priorities[$rule]
+    }
 
-# Reorder specs, priorities goes first
-$specs = [System.Collections.ArrayList]@()
-$specs.AddRange(@($Specifications | Where-Object { $_.Priority -lt $defaultPriority } | Sort-Object -Property Priority))
-$specs.AddRange(@($Specifications | Where-Object { $_.Priority -eq $defaultPriority }))
+    # Reorder specs, priorities goes first
+    $specs = [System.Collections.ArrayList]@()
+    $specs.AddRange(@($Specifications | Where-Object { $_.Priority -lt $defaultPriority } | Sort-Object -Property Priority))
+    $specs.AddRange(@($Specifications | Where-Object { $_.Priority -eq $defaultPriority }))
 
-return $specs
+    return $specs
 }
 
 function Get-BuildSpecifications
@@ -412,7 +453,12 @@ function Get-BuildSpecifications
         [Parameter(Mandatory = $true)]
         [ValidateScript( { Test-Path $_ -PathType "Container" })]
         [string]$Path
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$AutoGenerateWindowsVersionTags = (Get-SupportedWindowsVersions)
     )
+
+    $versionMap = Get-WindowsServerCoreToNanoServerVersionMap
 
     Get-ChildItem -Path $Path -Filter "build.json" -Recurse | ForEach-Object {
         $buildContextPath = $_.Directory.FullName
@@ -444,10 +490,9 @@ function Get-BuildSpecifications
             }
         }
 
-        $dockerFileContent = $dockerFile | Get-Content
-        $dockerFileArgLines = $dockerFileContent | Select-String -SimpleMatch "ARG " -CaseSensitive | ForEach-Object { Write-Output $_.ToString().Replace("ARG ", "") }
-        $dockerFileFromLines = $dockerFileContent | Select-String -SimpleMatch "FROM " -CaseSensitive | ForEach-Object { Write-Output $_.ToString().Replace("FROM ", "") }
+        $tags = @()
 
+        # expand tags for each Windows version
         $dataTags | ForEach-Object {
             $tag = $_
             $options = $tag.'build-options'
@@ -455,12 +500,47 @@ function Get-BuildSpecifications
             if ($null -eq $options)
             {
                 $options = @()
+            }
 
-                # TODO: Removed when all build.json files has been converted to new format
-                if ($tag.tag -like "*sql*")
-                {
-                    $options += "--memory 4GB"
+            if ($tag.tag -like "*`${*}*")
+            {
+                $AutoGenerateWindowsVersionTags | ForEach-Object {
+                    $windowsServerCoreVersion = $_
+                    $nanoServerVersion = $versionMap[$windowsServerCoreVersion]
+
+                    if ([string]::IsNullOrEmpty($nanoServerVersion))
+                    {
+                        throw ("Could not find a 'nanoserver' version in the version map for '{0}'." -f $windowsServerCoreVersion)
+                    }
+
+                    $copy = $tag | Select-Object *
+                    $copy.tag = $copy.tag.Replace("`${windowsservercore_version}", $windowsServerCoreVersion).Replace("`${nanoserver_version}", $nanoServerVersion)
+                    $copy.'build-options' = @()
+
+                    $options | ForEach-Object {
+                        $copy.'build-options' += $_.Replace("`${windowsservercore_version}", $windowsServerCoreVersion).Replace("`${nanoserver_version}", $nanoServerVersion)
+                    }
+
+                    $tags += $copy
                 }
+            }
+            else
+            {
+                $tags += $tag
+            }
+        }
+
+        $dockerFileContent = $dockerFile | Get-Content
+        $dockerFileArgLines = $dockerFileContent | Select-String -SimpleMatch "ARG " -CaseSensitive | ForEach-Object { Write-Output $_.ToString().Replace("ARG ", "") }
+        $dockerFileFromLines = $dockerFileContent | Select-String -SimpleMatch "FROM " -CaseSensitive | ForEach-Object { Write-Output $_.ToString().Replace("FROM ", "") }
+
+        $tags | ForEach-Object {
+            $tag = $_
+            $options = $tag.'build-options'
+
+            if ($null -eq $options)
+            {
+                $options = @()
             }
 
             $deprecated = $false
@@ -537,11 +617,14 @@ function Get-CurrentImages
         [Parameter(Mandatory = $true)]
         [ValidateScript( { Test-Path $_ -PathType "Container" })]
         [string]$Path
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$AutoGenerateWindowsVersionTags = (Get-SupportedWindowsVersions)
     )
 
     $tagParser = [regex]"^(?<repository>[^:]*):(?<version>[^-]*)-(?<os>[^-]+)(?:-(?<build>.*))?$"
 
-    Get-BuildSpecifications -Path $Path | ForEach-Object {
+    Get-BuildSpecifications -Path $Path -AutoGenerateWindowsVersionTags $AutoGenerateWindowsVersionTags | ForEach-Object {
         $spec = $_
         $match = $tagParser.Match($spec.Tag)
 
@@ -572,12 +655,15 @@ function Get-CurrentImagesMarkdown
         [Parameter(Mandatory = $true)]
         [ValidateScript( { Test-Path $_ -PathType "Container" })]
         [string]$Path
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$AutoGenerateWindowsVersionTags = (Get-SupportedWindowsVersions)
     )
 
     Write-Output "| Version | Repository | OS  | Build      | Tag |"
     Write-Output "| ------- | ---------- | --- | -----------| --- |"
 
-    Get-CurrentImages -Path $Path | Sort-Object -Property Version, Build, Repository -Descending | ForEach-Object {
+    Get-CurrentImages -Path $Path -AutoGenerateWindowsVersionTags $AutoGenerateWindowsVersionTags | Sort-Object -Property Version, Build, Repository -Descending | ForEach-Object {
         $dockerFileUrl = (Resolve-Path $_.DockerFilePath -Relative).Replace(".\", "").Replace("\", "/").Replace(" ", "%20")
 
         if ($_.Deprecated)
@@ -589,4 +675,62 @@ function Get-CurrentImagesMarkdown
             Write-Output ("| {0} | {1} | {2} | {3 } | ``{4}`` [Dockerfile]({5}) |" -f $_.Version, $_.Repository, $_.OS, $_.Build, $_.Tag, $dockerFileUrl)
         }
     }
+}
+
+function Get-SupportedWindowsVersions
+{
+    # NOTE: Order is important, newest first
+    Write-Output ("1903", "ltsc2019")
+}
+
+function Get-WindowsServerCoreToNanoServerVersionMap
+{
+    Write-Output @{
+        "1903"     = "1903";
+        "ltsc2019" = "1809";
+        "1803"     = "1803";
+        "1709"     = "1709";
+        "ltsc2016" = "sac2016"
+    }
+}
+
+function Get-LatestSupportedVersion
+{
+    # load Windows image specifications
+    $specs = Get-BuildSpecifications -Path (Join-Path $PSScriptRoot "\..\..\windows")
+
+    # find all Sitecore versions
+    $versions = $specs | Where-Object { $_.Tag -like "sitecore-*:*windowsservercore-*" } | Select-Object -ExpandProperty Tag
+    $versions = $versions | ForEach-Object {
+        $_.Substring($_.IndexOf(':') + 1)
+    }
+
+    $versions = $versions | ForEach-Object {
+        $_.Substring(0, $_.IndexOf('-'))
+    }
+
+    $versions = $versions | Sort-Object -Unique -Descending
+
+    # pick latest Sitecore version
+    $sitecore = $versions | Select-Object -First 1
+
+    # pick latest 'windowsservercore' LTSC version
+    $windowsServerCore = (Get-SupportedWindowsVersions | Where-Object { $_ -like "ltsc*" } | Select-Object -First 1)
+
+    # pick latest 'nanoserver' version matching latest 'windowsservercore' LTSC version
+    $nanoserver = (Get-WindowsServerCoreToNanoServerVersionMap)[$windowsServerCore]
+
+    Write-Output (New-Object PSObject -Property @{
+            Sitecore          = $sitecore;
+            WindowsServerCore = $windowsServerCore;
+            NanoServer        = $nanoserver;
+        })
+}
+
+function Get-LatestSupportedVersionTags
+{
+    $latest = Get-LatestSupportedVersion
+
+    Write-Output ("*:{0}*{1}" -f $latest.Sitecore, $latest.WindowsServerCore)
+    Write-Output ("*:{0}*{1}" -f $latest.Sitecore, $latest.NanoServer)
 }
